@@ -1,7 +1,7 @@
 #### README.md
 
 ##### Ansible Based Automated Configuration System:
-The Ansible playbooks (scripts) contained in this repository are a small set representing a larger server configuration system. They are intended to give an idea of a few of the capabilities possessed and technologies understood by the developer of the scripts.
+The Ansible playbooks contained in this repository are a small set representing a larger server configuration system. They are intended to give an idea of a few of the capabilities possessed by the developer of the scripts.
 
 ##### Technologies Represented
 Ansible, Nginx, Redis, MySQL cluster, Tinc.
