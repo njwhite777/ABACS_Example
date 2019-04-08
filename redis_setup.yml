@@ -1,0 +1,155 @@
+---
+- hosts: '{{ group_name }}'
+  remote_user: '{{ remote_user }}'
+  tasks:
+    # Load the both the packages for inclusion on hosts
+  - name: 'Including the redis config.'
+    include_vars:
+      file: '{{ item }}'
+    with_items:
+      - ['../nsl_servers/configs/globals.yml' ,'../nsl_servers/configs/redis.yml', '../nsl_servers/configs/host.yml' ]
+  - set_fact:
+      redis_ports: []
+      redis_bus_ports: []
+      start_port: '{{ redis.start_port }}'
+      bus_port_start: '{{ redis.bus_port_start }}'
+  - set_fact:
+      redis_ports: '{{ redis_ports }} + [ {{ start_port |string }} ]'
+      start_port: '{{ start_port | int + 1 }}'
+      redis_bus_ports: '{{ redis_bus_ports }} + [ {{ bus_port_start }} ]'
+      bus_port_start: '{{ bus_port_start | int + 1 }}'
+    with_items: '{{ host.current_group_internal_ips }}'
+    # Installing the php redis.
+  - name: 'Making sure the redis gems are installed for ruby. Ruby must be version > 2.2.1.'
+    raw: 'gem install redis'
+  - name: install redis packages
+    include: './tasks/install_packages.yml list_of_packages={{ redis.packages }}'
+    # Setting up firewalls to allow redis among redis hosts.
+  - name: 'Set up rich rules to allow certain internal ports for redis.'
+    include: './tasks/firewall_rich_rule.yml allow_port={{ item[1] }} current_allow_ip={{ item[0] }}'
+    with_nested:
+      - '{{ redis.ips }}'
+      - '{{ redis_ports }}'
+  - name: 'Set up rich rules to allow certain internal ports for redis.'
+    include: './tasks/firewall_rich_rule.yml allow_port={{ item[1] }} current_allow_ip={{ item[0] }}'
+    with_nested:
+      - '{{ redis.ips }}'
+      - '{{ redis_bus_ports }}'
+  - name: 'Set up redis port for load balancer.'
+    include: './tasks/firewall_rich_rule.yml allow_port={{ item[1] }} current_allow_ip={{ item[0] }}'
+    with_nested:
+      - '{{ globals.load_balancer_internal_ips }}'
+      - '{{ redis_ports }}'
+  - name: 'Download redis cluster managment script from github.'
+    get_url:
+      url: 'https://raw.githubusercontent.com/antirez/redis/3.2.11/src/redis-trib.rb'
+      dest: /root/bin/redis-trib.rb
+      mode: 0750
+  - name: 'Set up rich rules to allow localhost to all ports.'
+    include: './tasks/firewall_rich_rule.yml allow_port={{ item[1] }} current_allow_ip={{ item[0] }}'
+    with_nested:
+      - [ '127.0.0.1' ]
+      - '{{ redis_ports }}'
+  - name: "Restarting firewall service"
+    raw: 'systemctl restart firewalld'
+
+  - name: Setup directories in redis home
+    file:
+      path: '{{ redis.home }}/redis_{{ item }}'
+      state: directory
+      owner: redis
+      group: redis
+      mode: 0750
+    with_items:
+      - '{{ redis_ports }}'
+  - set_fact: tcp_session_paths_str=''
+  - set_fact: tcp_session_paths_str="{{ tcp_session_paths_str + "seed[]=" + host.internal_ip + ":" }}{{ item|string }}&"
+    with_items:
+      - '{{ redis_ports }}'
+  - set_fact: tcp_session_paths_str="{{ tcp_session_paths_str + "timeout=5&read_timeout=5&persistent=0&failover=distribute" }}"
+
+  - name: 'Copy the php.ini'
+    template:
+      src: './templates/centos7/etc/php.ini.j2'
+      dest: '/etc/php.ini'
+      owner: root
+      group: root
+      mode: 0644
+  - name: setup php-redis configuration options in php.ini
+    blockinfile:
+      path: /etc/php.ini
+      mode: 0750
+      marker: ;{mark} ANSIBLE SESSION MANAGED BLOCK
+      block: |
+        session.save_handler = rediscluster
+        session.save_path    = "{{ tcp_session_paths_str }}"
+  #
+  - name: 'Copy the redis template'
+    include: './tasks/template_config.yml source_path=./templates/centos7/etc/redis.conf.j2 destination_path={{ redis.home }}/redis_{{ item }}/redis_{{ item }}.conf redis_port={{ item }}'
+    with_items:
+      - '{{ redis_ports }}'
+
+  - name: 'Copy the redis group service template'
+    include: './tasks/template_config.yml source_path=./templates/centos7/usr/lib/systemd/system/redis@.service.j2 destination_path=/usr/lib/systemd/system/redis@.service'
+
+  - name: 'Copy the redis group target template'
+    include: './tasks/template_config.yml source_path=./templates/centos7/usr/lib/systemd/system/redis.target.j2 destination_path=/usr/lib/systemd/system/redis.target'
+  - name: 'Reload systemd'
+    raw: systemctl daemon-reload
+  - name: 'Append disable hugepage'
+    blockinfile:
+      path: '/etc/rc.d/rc.local'
+      mode: 0750
+      block: |
+        if test -f /sys/kernel/mm/transparent_hugepage/enabled; then
+            echo never > /sys/kernel/mm/transparent_hugepage/enabled
+        fi
+        if test -f /sys/kernel/mm/transparent_hugepage/defrag; then
+            echo never > /sys/kernel/mm/transparent_hugepage/defrag
+        fi
+  - name: 'Append the memory setting to /etc/sysctl.conf'
+    lineinfile:  path=/etc/sysctl.conf  line='vm.overcommit_memory = 1'
+  - include: './tasks/enable_service.yml service=rc-local'
+  - name: 'Remove redis node file if it exists'
+    file:
+      path: '{{ redis.home }}/redis_{{ item }}/_cluster_node_{{ item }}.conf'
+      state: absent
+    with_items:
+      - '{{ redis_ports }}'
+  - name: 'enable redis pids'
+    raw: 'systemctl enable redis@{{ item }}'
+    with_items: '{{ redis_ports }}'
+  - name: 'start redis group'
+    raw: 'systemctl start redis.target'
+  - name: 'Disable any redis.service that might be hanging about.'
+    raw: 'systemctl disable redis'
+  - name: 'Restart firewall-cmd'
+    include: './tasks/restart_service.yml service=firewalld'
+  # Get the scripts to setup redis 
+  - name: 'Setting up the cluster by writing scripts'
+    template:
+      src: '{{ item }}'
+      dest: '/root/'
+      owner: root
+      group: root
+      mode: 0754
+    with_fileglob:
+      - './templates/centos7/root/redis_cluster*'
+  - name: "Setup redis ports in selinux."
+    raw: "semanage port -a -t redis_port_t -p tcp {{ item }}"
+    with_items:
+      - '[] + {{ redis_bus_ports }} + {{ redis_ports }}'
+    ignore_errors: yes
+  # Redis cluster setup.
+  - name: "Flush redis info."
+    raw: "redis-cli -p {{ item }} flushall && redis-cli -p {{ item }} cluster reset soft"
+    with_items:
+      - '{{ redis_ports }}'
+    ignore_errors: yes
+  - name: 'start redis group'
+    raw: 'systemctl restart redis.target'
+  - name: 'Running the scripts'
+    when: host.name == "data1"
+    shell: /root/redis_cluster.sh
+    args:
+      chdir: /root/

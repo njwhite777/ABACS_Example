@@ -1,0 +1,118 @@
+---
+- hosts: '{{ group_name }}'
+  remote_user: root
+  tasks:
+  - name: include globals.
+    include_vars:
+      file: '../config.yml'
+  - name: include the necessary variables.
+    include_vars:
+      file: './vars/config.yml'
+  - name: setting facts and installing packages
+    set_fact: install_package="nginx" service="nginx"
+  - include: './tasks/install_package.yml'
+  - hostname:
+      name: '{{ current_config }}'
+  - name: set up basic nginx server
+    template:
+      src: ./templates/centos7/etc/nginx/nginx.conf.j2
+      dest: /etc/nginx/nginx.conf
+      owner: root
+      group: root
+      mode: 0644
+  - name: Make directories for more complicated setup
+    file:
+      path: '/etc/nginx/{{item}}'
+      state: directory
+      mode: 0755
+    with_items: '{{ nginx_directories }}'
+  - name: Setting up the .well-known directory
+    file:
+      path: '{{ web_root }}/.well-known'
+      state: directory
+      mode: 0755
+      owner: nginx
+      group: nginx
+      recurse: yes
+  - name: Copy templates to sites-availible
+    template:
+      src: './templates/centos7/etc/nginx/sites-availible/{{ item }}.conf.j2'
+      dest: '/etc/nginx/sites-availible/{{ item }}.conf'
+      owner: root
+      group: root
+      mode: 0644
+    with_items: '{{ nginx_availible }}'
+  - name: setting facts and installing packages
+    set_fact: install_package="certbot"
+  - include: './tasks/install_package.yml'
+# ==============================================
+# Enables and starts nginx {{ service }} from two set_facts ago
+  # - include: './tasks/enable_service.yml'
+# ==============================================
+# Time to set up le certs!
+  # - include: './tasks/letsencrypt.yml'
+# ==============================================
+# Generate dhparam takes a long time, so asynced to background.
+  # - include: './tasks/generate_dhparam.yml'
+# ==============================================
+# Links enabled sites in nginx
+  - name: Link templates in sites-enabled
+    file:
+      src: '/etc/nginx/sites-availible/{{ item }}.conf'
+      dest: '/etc/nginx/sites-enabled/{{ item }}.conf'
+      state: link
+    with_items: '{{ nginx_availible }}'
+# ==============================================
+# Builds users in environment
+  - name: Build users for dev environment...
+    include: './tasks/add_user.yml'
+    with_together:
+      - "{{ build_users }}"
+      - "{{ configurations }}"
+  - name: Add keys for the git remote repo...
+    include: './tasks/git_ssh_setup.yml'
+    with_together:
+      - "{{ build_users }}"
+      - "{{ configurations }}"
+# ==============================================
+# Sets up more complex nginx config
+  - name: Set variables for more complex nginx server.
+    set_fact: include_sites_enabled="include /etc/nginx/sites-enabled/*.conf;"
+  - name: Set up more complex nginx server.
+    template:
+      src: ./templates/centos7/etc/nginx/nginx.conf.j2
+      dest: /etc/nginx/nginx.conf
+      owner: root
+      group: root
+      mode: 0644
+# ==============================================
+# Sets up php-fpm socket
+  - name: Set up php-fpm
+    template:
+      src: ./templates/centos7/etc/php-fpm.d/www.conf.j2
+      dest: /etc/php-fpm.d/www.conf
+      owner: root
+      group: root
+      mode: 0644
+# ==============================================
+# Copy expected configs
+  - name: Copy config files to nginx config directories
+    template:
+      src: '{{ item[0] }}'
+      dest: '{{ item[1] }}'
+      owner: root
+      group: root
+      mode: 0644
+    with_together:
+      - ['./templates/centos7/etc/nginx/default.d/php.conf.j2','./templates/centos7/etc/nginx/default.d/ssl-params.conf.j2','./templates/centos7/etc/nginx/conf.d/php-fpm.conf.j2']
+      - ['/etc/nginx/default.d/php.conf','/etc/nginx/default.d/ssl-params.conf','/etc/nginx/conf.d/php-fpm.conf']
+# ==============================================
+# SSL Cert auto renewal using root's crontab file:
+# These are offset by 3 mins for each host to make sure that the nginx service is not down on all boxes at the same time
+  - name: Set up cert auto-renewal with crontab
+    raw: echo '{{ (ansible_hostname[-1]|int)*2 }} 4 * * * certbot certonly -n --webroot -w /usr/share/nginx/html --agree-tos --email admin@nearspacelaunch.com --post-hook "systemctl reload nginx && /bin/bash /root/copy_certs.sh"' -d {{ prod_server_name }} -d {{ dev_server_name }} -d {{ test_server_name }} >> /var/spool/cron/root
+# ==============================================
+  - set_fact: service="php-fpm"
+  - include: './tasks/enable_service.yml'
+  - set_fact: service="nginx"
+  - include: './tasks/restart_service.yml'

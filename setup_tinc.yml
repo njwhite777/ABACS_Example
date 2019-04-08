@@ -1,0 +1,163 @@
+---
+# When you want to do just the install of tinc just run a
+# ansible-playbook -i hosts ./ansible-playbooks/setup_tink.yml --extra-vars="remote_hosts=nsl_hosts" --tags="installs"
+# To install and setup
+# ansible-playbook -i hosts ./ansible-playbooks/setup_tink.yml --extra-vars="remote_hosts=nsl_hosts" --tags="setup"
+
+- hosts: '{{ remote_hosts }}'
+  vars:
+    tinc_network_ports: ['655']
+    tinc_network_protocalls: ['tcp','udp']
+    includes_dir: './includes/'
+    include_vars: './vars/'
+    inc_tinc_service_tmpl: './service_templates'
+  remote_user: root
+  tasks:
+
+  - name: 'Including the files in {{ include_vars }}.'
+    include_vars:
+      file: '{{ item }}'
+    with_items:
+    - '{{include_vars}}cluster.yml'
+    - '{{include_vars}}host.yml'
+    tags: always
+
+  - name: 'Make sure tink is installed'
+    include: '{{ includes_dir }}install_service.yml service_name=tinc'
+    tags: [ 'installs','setup' ]
+
+  - name: 'Include Copy Task'
+    include: '{{ includes_dir }}copy_tree.yml copy_from_path={{ tinc_root_path }} copy_file_to_path=/etc file_mode=0750'
+    tags: [ 'setup' ]
+
+  - name: 'Copying templated file from {{ tinc.template_path }}.'
+    template:
+      src: '{{ tinc.template_path }}/{{ tinc.setup_files[item].name }}'
+      dest: '{{ tinc.setup_files[item].dest_path }}/{{ tinc.setup_files[item].dest_name }}'
+      owner: root
+      group: root
+      mode: '{{ tinc.setup_files[item].mode }}'
+    with_items: '{{ tinc.setup_files }}'
+    tags: [ 'setup' ]
+
+  - name: 'Copying tinc config file.'
+    template:
+      src: '{{ item.0 }}'
+      dest: '{{ item.1 }}'
+      owner: root
+      group: root
+      mode: '0744'
+    with_together:
+      - ['./service_templates/tinc/tinc.conf.j2']
+      - ['/etc/tinc/nsl_cluster_vpn/tinc.conf']
+    tags: [ 'setup' ]
+
+  - name: 'Setting up keys on each of the hosts.'
+    command: 'tincd -n {{ tinc.net_name }} -K4096'
+    tags: ['setup','new']
+
+  - name: 'Retrieve updated tinc host file from each host'
+    fetch:
+      src: '{{ tinc.setup_files[ tinc_host_name ].dest_path }}/{{ tinc_host_name }}'
+      dest: '/tmp/{{ tinc_host_name }}'
+      flat: true
+    tags: ['setup','new']
+
+  - name: 'Copy tinc host file to each of the other hosts.'
+    synchronize:
+      src: '/tmp/{{ item }}'
+      dest: '{{ tinc_remote_hosts }}/{{ item }}'
+    with_items:
+      - '{{ tinc_host_names | difference( [ tinc_host_name ] ) }}'
+    tags: ['setup','new']
+
+  - name: 'Copying other tinc setup files.'
+    template:
+      src: '{{ item.0 }}'
+      dest: '{{ item.1 }}'
+      owner: root
+      group: root
+      mode: '0751'
+    with_together:
+      - ['./service_templates/tinc/tinc-down.j2','./service_templates/tinc/tinc-up.j2']
+      - ['/etc/tinc/nsl_cluster_vpn/tinc-down','/etc/tinc/nsl_cluster_vpn/tinc-up']
+    tags: [ 'setup' ]
+
+  - name: 'Making sure files are owned by root'
+    file:
+      path: '/etc/tinc'
+      state: directory
+      owner: 'root'
+      group: 'root'
+      recurse: yes
+    tags: [ 'setup']
+
+  - name: "Opening ports for service tinc"
+    iptables:
+      state: present
+      chain: INPUT
+      action: insert
+      ctstate: NEW,ESTABLISHED
+      jump: ACCEPT
+      comment: "Rule added for tinc vpn networking (ANSIBLE MANAGED)"
+      destination_port: '{{ item.2 }}'
+      source: '{{ item.0 }}/32'
+      protocol: '{{ item.1 }}'
+      destination: '{{ host.ip }}/32'
+      rule_num: 5
+    with_nested:
+    - '{{ tinc_host_ips | difference( [ host.ip ] ) }}'
+    - '{{ tinc_network_protocalls }}'
+    - '{{ tinc_network_ports }}'
+    tags: ['setup', 'firewall']
+
+  - name: "Saving iptables and restarting service"
+    raw: "iptables-save > /etc/sysconfig/iptables && service iptables restart"
+    tags: ['setup','firewall','restart-firewall']
+
+  - name: "Setting up tincd service."
+    template:
+      src: './service_templates/etc/init.d/tincd'
+      dest: '/etc/init.d/tincd'
+      mode: '0711'
+      owner: root
+      group: root
+    tags: ['setup','tinc_service']
+
+  - name: "Making sure it is known about by chkconfig"
+    raw: "chkconfig --add tincd"
+    tags: ['setup','tinc_service']
+
+  - name: "Checking on service,"
+    raw: 'chkconfig --list tincd'
+    register: tincd_service_status
+    tags: ['setup','tinc_service','check']
+
+  - name: "Providing output for verification."
+    debug: msg="{{ tincd_service_status }}"
+    tags: ['setup','tinc_service','check']
+
+  - name: "Set up as reboot service with chkconfig"
+    raw: 'chkconfig tincd on'
+    tags: ['setup','tinc_service','on']
+
+  - name: "Starting tincd service."
+    raw: 'service tincd start'
+    tags: ['setup','tinc_service','on']
+
+  - name: "Tear down reboot service with chkconfig"
+    raw: 'chkconfig tincd off'
+    tags: [ 'off' ]
+
+# TEST tinc setup:
+#
+  - name: "Netcat other hosts"
+    raw: "nc -zv {{ item }} 22"
+    register: r
+    with_items:
+      - "{{ host.other_vpn_ips }}"
+    tags: ['test']
+
+  - name: "Results"
+    debug: msg="{{ r }}"
+    tags: ['test']

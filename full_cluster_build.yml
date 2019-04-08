@@ -1,0 +1,15 @@
+---
+- name: 'Setting up the hostname, and /etc/hosts files.'
+  import_playbook: './setup_hosts_settings.yml'
+
+- name: 'Setting up services for the latency test'
+  import_playbook: './setup_latency_test.yml'
+
+- name: 'Setup tinc'
+  import_playbook: './setup_tinc.yml'
+
+- name: 'Setup phpMyAdmin fixes.'
+  import_playbook: './setup_phpMyAdmin.yml'
+
+- name: 'Setting up sync_watcher service on hosts'
+  import_playbook: './setup_sync_watcher.yml'

@@ -1,0 +1,167 @@
+---
+- hosts: '{{ remote_hosts }}'
+  vars:
+    includes_dir: './includes/'
+    mysql_replication_ports: [3306,4568,4444]
+    mysql_replication_ports_1: [ 4567 ]
+
+  remote_user: '{{ remote_user }}'
+  tasks:
+  - name: 'including the files in the includes.'
+    include_vars:
+      file: '{{ item }}'
+    with_items:
+      - './vars/cluster.yml'
+      - './vars/host.yml'
+    tags: always
+
+  - name: 'Stopping the mysql instance'
+    raw: 'service mysqld stop'
+    tags: [ 'setup','install_galera' ]
+    ignore_errors: yes
+
+  - name: 'Checking if ius is installed'
+    raw: rpm -q ius-release
+    register: rpm_check
+
+  - name: 'Installing ius repository if not already installed'
+    raw: 'rpm -ivh https://dl.iuscommunity.org/pub/ius/stable/CentOS/6/x86_64/ius-release-1.0-15.ius.centos6.noarch.rpm'
+    when: rpm_check.stdout.find('is not installed') != -1
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Removing unnecessary packages'
+    raw: 'yum -y --disableexcludes=all remove mysql mysql-server mysql-libs'
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Installing upgraded  mysql from repo'
+    raw: 'yum -y install install mysql55 mysql55-server mysql55-libs mysqlclient16 '
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Preparing the environment for the galera install.'
+    raw: 'yum -y remove mysql mysql55-libs mysqlclient16'
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Copying the yum repo file into place.'
+    copy:
+      src: ./service_templates/etc/yum.repos.d/galera.repo
+      dest: /etc/yum.repos.d/galera.repo
+      owner: root
+      group: root
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Installing the necessary libraries from galera'
+    raw: 'yum -y install galera-3 mysql-wsrep-5.5'
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Reinstalling missing packages'
+    raw: 'yum -y install postfix vixie-cron MySQL-python perl-DBD-MySQL php-mysql phpMyAdmin'
+    tags: [ 'setup','install_galera' ]
+
+  - name: 'Restoring the old phpMyAdmin file'
+    raw: 'mv -f /etc/phpMyAdmin.conf.rpmsave /etc/phpMyAdmin.conf'
+
+  # #####################################################################
+  # MYSQL galera cluster setup
+  # #####################################################################
+  - name: 'Making sure ssl directory is owned by mysql'
+    file:
+      path: /etc/mysql/ssl
+      state: directory
+      owner: mysql
+      group: mysql
+      mode: 0500
+    tags: [ 'setup','install_galera','mysql_setup'  ]
+
+  - name: 'Stopping any mysql instances and restarting with wsrep off'
+    raw: 'service mysql stop && service mysql start --wsrep-on=OFF'
+    ignore_errors: yes
+    tags: [ 'setup','install_galera','mysql_setup' ]
+
+  - name: 'Including the vault file. Be sure to tell the script to ask for the password with --ask-vault-pass'
+    include_vars:
+      file: './secure/mysql_creds.yml'
+    tags: ['setup','install_galera','mysql_setup']
+
+  - name: 'Making sure that database tables get converted to InnoDB'
+    # when: host.name == "data2c1"
+    debug: msg="mysql -u root -p'{{ galera.existing_users.root.password }}' '{{ galera.databases.names|first }}' -e'SHOW TABLE STATUS WHERE Engine='MyISAM';' | awk 'NR>1 {print 'ALTER TABLE '$1' ENGINE = InnoDB;'}' | mysql -u root -p'{{ galera.existing_users.root.password }}' '{{ galera.databases.names|first }}'"
+    tags: [ 'setup','install_galera','mysql_setup' ]
+
+  - name: 'Running the mysql upgrade command'
+    raw: 'mysql_upgrade -u root -p{{ galera.existing_users.root.password  }} --force'
+    ignore_errors: yes
+    tags: [ 'setup','install_galera','mysql_setup' ]
+
+  - name: 'Stopping mysql'
+    raw: 'service mysql stop'
+    tags: [ 'setup','install_galera','mysql_setup' ]
+
+  - name: "Copy the grastate file to all the hsots"
+    copy:
+      src: './service_templates/grastate.dat'
+      dest: '/var/lib/mysql/grastate.dat'
+      mode: 0660
+      owner: mysql
+      group: mysql
+    tags: [ 'setup','install_galera','mysql_setup'  ]
+
+  - name: "Copy the mysql configuration file"
+    template:
+      src: './service_templates/my.cnf'
+      dest: '/etc/my.cnf'
+      mode: 0660
+      owner: root
+      group: root
+    tags: [ 'setup','install_galera','mysql_setup'  ]
+
+  - name: "Set one of the hosts to the bootstrap node for galera"
+    when: host.name == "data2c1"
+    lineinfile:
+      path: '/var/lib/mysql/grastate.dat'
+      mode: 0660
+      regexp: '^safe_to_bootstrap.*$'
+      line: 'safe_to_bootstrap: 1'
+      state: present
+    tags: [ 'setup','install_galera','mysql_setup'  ]
+
+  - name: "Opening ports for mysql replication"
+    iptables:
+      state: present
+      chain: INPUT
+      action: insert
+      ctstate: NEW,ESTABLISHED
+      jump: ACCEPT
+      comment: "Rule added for mysql replicatoin over vpn (ANSIBLE MANAGED)"
+      destination_port: '{{ item.2 }}'
+      source: '{{ item.0 }}/32'
+      protocol: '{{ item.1 }}'
+      destination: '{{ host.vpn_ip }}/32'
+      rule_num: 5
+    with_nested:
+    - '{{ tinc_internal_ips | difference( [ host.vpn_ip ] ) }}'
+    - [ 'tcp' ]
+    - '{{ mysql_replication_ports }}'
+    tags: ['firewall','setup']
+
+  - name: "Opening ports for mysql replication"
+    iptables:
+      state: present
+      chain: INPUT
+      action: insert
+      ctstate: NEW,ESTABLISHED
+      jump: ACCEPT
+      comment: "Rule added for mysql replicatoin over vpn (ANSIBLE MANAGED)"
+      destination_port: '{{ item.2 }}'
+      source: '{{ item.0 }}/32'
+      protocol: '{{ item.1 }}'
+      destination: '{{ host.vpn_ip }}/32'
+      rule_num: 5
+    with_nested:
+    - '{{ tinc_internal_ips | difference( [ host.vpn_ip ] ) }}'
+    - [ 'tcp','udp' ]
+    - '{{ mysql_replication_ports_1 }}'
+    tags: ['firewall','setup']
+
+  - name: "Saving iptables and restarting service"
+    raw: "iptables-save > /etc/sysconfig/iptables && service iptables restart"
+    tags: ['setup','firewall','restart-firewall']
